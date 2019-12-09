@@ -13,46 +13,42 @@
 ##
 #---
 
-# declaring the php session directory location
-# basically this is your session.save_path
-php_session_dir=/var/lib/php5
-
 # this is the php session prefix inside redis
-php_session_prefix=PHPREDIS_SESSION
+: ${php_session_prefix:=PHPREDIS_SESSION}
+: ${VERBOSE:=}
+: ${DRYRUN:=}
 
-# this is what happens during the find loop underneath
-# when the script is called with php session file as parameter
-# it outputs the redis protocol for mass insertion
-if test -n "$1" -a -f "$1"; then
+# function to generate the data file with redis protocol for
+# for mass insertion http://redis.io/topics/mass-insert
+session_2_redis_pipe() {
     # generate the session id cause we need to get the length of it
     session_id=$php_session_prefix:$(basename ${1/sess_/})
-    echo -n -e "*3\r\n\$3\r\nSET\r\n\$${#session_id}\r\n$session_id\r\n\$$(stat -c"%s" $1)\r\n$(sed 's/\\/\\\\/g' $1)\r\n"
-    exit 0
-fi
-
-# trap method to cleanup on exit
-trap cleanexit EXIT
-
-cleanexit () {
-    if test -d "$tmp_dir"; then
-        rm -rf "$tmp_dir"
-    fi
+    echo -n -e "*3\r\n\$3\r\nSET\r\n\$${#session_id}\r\n$session_id\r\n\$$(stat -c"%s" $1)\r\n"
+    #sed 's/\\/\\\\/g' $1
+    cat "$1"
+    echo -n -e "\r\n"
 }
 
-# create temp dir where data is stored
-tmp_dir=`mktemp -d`
+# Directory found, assume it's where the sessions are stored.
+set -o pipefail
+errors=0
 
-# first cleanup all zero byte sessions
-find $php_session_dir -size 0 -exec rm -f {} \;
-
-# then generate the data file with redis protocol for
-# for mass insertion http://redis.io/topics/mass-insert
-# during the find loop we call ourselves with a file as first param
-# this is basically to have everything in a single script
-find $php_session_dir -type f -exec $0 {} \; > $tmp_dir/data.txt
-
-# load data into redis using the redis-cli pipe mode
-cat $tmp_dir/data.txt | redis-cli --pipe
-
-# exit gracefully
-exit 0
+find "$1" -type f \! -size 0 |
+  while read sessfile ; do
+    [[ $VERBOSE ]] && echo -n "Processing ${sessfile##*/}..." ${DRYRUN:+(dry-run)...}
+    if [[ $DRYRUN ]]; then
+      echo
+      session_2_redis_pipe "$sessfile"
+    else
+      session_2_redis_pipe "$sessfile" | redis-cli --pipe &>/dev/null
+    fi
+    if [[ $? != 0 ]]; then
+        errors=1
+        if [[ $VERBOSE ]] ;
+          then echo "Failed";
+          else echo >&2  "Failed to process $1"
+        fi
+    fi
+    [[ $VERBOSE ]] && echo "Success!" ${DRYRUN:+(dry-run)...}
+done
+exit $errors
